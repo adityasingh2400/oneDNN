@@ -266,7 +266,8 @@ static inline sdpa_desc_t create_sdpa_desc(const memory_desc_t *q_md,
         const memory_desc_t *scale_md, bool invert_scale, dim_t kv_head_number,
         attn_mask_type_t attn_mask_type, alg_kind_t softmax_alg,
         prop_kind_t prop, const primitive_attr_t *kq_attr,
-        const primitive_attr_t *vs_attr) {
+        const primitive_attr_t *vs_attr,
+        const memory_desc_t *stats_md = nullptr) {
     auto sdpa_desc = sdpa_desc_t();
     sdpa_desc.primitive_kind = primitive_kind::sdpa;
     sdpa_desc.q_desc = *q_md;
@@ -289,6 +290,7 @@ static inline sdpa_desc_t create_sdpa_desc(const memory_desc_t *q_md,
     }
     sdpa_desc.v_desc = *v_md;
     sdpa_desc.dst_desc = *dst_md;
+    if (stats_md) sdpa_desc.stats_desc = *stats_md;
     if (attn_mask_md) sdpa_desc.attn_mask_desc = *attn_mask_md;
     sdpa_desc.scale_desc = *scale_md;
     sdpa_desc.invert_scale = invert_scale;
