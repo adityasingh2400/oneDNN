@@ -29,6 +29,7 @@
 #include "gpu/intel/jit/ir/kernel_info.hpp"
 #include "gpu/intel/jit/utils/utils.hpp"
 #include "gpu/intel/logging.hpp"
+#include "gpu/intel/primitive_attr.hpp"
 
 namespace dnnl {
 namespace impl {
@@ -69,6 +70,13 @@ static tensor_ref_t get_tensor_ref(const config_t &cfg,
     if (name == "bia") return {&cfg.bia_layout(), pd->invariant_bia_md()};
     if (name == "dst") return {&cfg.dst_layout(), pd->invariant_dst_md()};
     return {};
+}
+
+// GRF mode of the convolution kernel, see init_regs(). The pd-time config has
+// no GRF mode set yet unless it's overridden from the environment.
+static int conv_regs(const config_t &cfg) {
+    if (cfg.options_param().is_overridden("regs")) return cfg.regs();
+    return default_regs(cfg);
 }
 
 #define CONV_CHECK(_st) \
@@ -414,9 +422,13 @@ private:
                 = into<uint32_t>(memory_tracking::names::key_nested_multiple
                         + data.reorders.size());
         r.is_input = (id == kernel_id_t::pre_reorder);
+        // Keep the GRF mode in sync with the convolution kernel to avoid GRF
+        // mode switching stalls.
+        primitive_attr_t attr;
+        CHECK(attr.set_gpu_attr(gpu_primitive_attr_t(conv_regs(data.pd_cfg))));
         CHECK(reorder_primitive_desc_create(r.pd, engine,
                 r.is_input ? &user_md : &r.compute_md,
-                r.is_input ? &r.compute_md : &user_md, &default_attr()));
+                r.is_input ? &r.compute_md : &user_md, &attr));
         pd->scratchpad_registry().registrar().book(
                 r.nested_key, r.pd->scratchpad_registry());
         return status::success;
