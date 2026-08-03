@@ -4058,7 +4058,9 @@ struct jit_brgemm_matmul_copy_b_bf16_t
         , is_dynamic_stride(is_runtime_value(src_stride))
         , is_dynamic_N(conf->is_runtime_N)
         , do_N_loop(conf->LDB < conf->N_blk)
-        , req_cvtf82f16(conf->is_f8 && conf->isa == avx10_2)
+        , req_cvtf82f16(one_of(conf->orig_wei_dt, data_type::f8_e4m3,
+                                data_type::f8_e5m2)
+                  && conf->wei_dt == data_type::f16 && conf->isa == avx10_2)
         , req_cvtps2bf16(conf->is_bf32 || conf->is_bf16_with_int_wei)
         , req_zp_b_shift(conf->has_zero_point_b && conf->with_wei_decompression)
         , req_apply_wei_scales(conf->apply_scales_in_buffer_b)
@@ -6396,7 +6398,9 @@ struct jit_brgemm_matmul_copy_b_cvt_bf16_t
         , src_stride_(
                   (conf->LDB * k_blk_step * typesize_) / src_elems_per_byte_)
         , tr_src_stride_(conf_->LDB * k_blk_step * tr_typesize_)
-        , req_cvtf82f16_(conf_->is_f8 && conf_->isa == avx10_2)
+        , req_cvtf82f16_(one_of(conf->orig_wei_dt, data_type::f8_e5m2,
+                                 data_type::f8_e4m3)
+                  && conf_->wei_dt == data_type::f16 && conf_->isa == avx10_2)
         , req_zp_b_shift_(
                   conf_->has_zero_point_b && conf_->with_wei_decompression)
         , req_apply_wei_scales_(conf_->apply_scales_in_buffer_b)
@@ -6613,7 +6617,7 @@ void jit_brgemm_matmul_copy_b_cvt_bf16_t<Vmm>::copy_block(
 
     // fp8->f16: only 1 VMM per block needed(not 2-register packing)
     // and the full register pool is used
-    static int blk_sz = req_cvtf82f16_ ? 1 : k_blk_step;
+    const int blk_sz = req_cvtf82f16_ ? 1 : k_blk_step;
     const int max_regs_available = isa_num_vregs(conf_->isa) - reserved_regs_;
     const int max_unroll = max_regs_available / blk_sz;
 
@@ -6628,10 +6632,10 @@ void jit_brgemm_matmul_copy_b_cvt_bf16_t<Vmm>::copy_block(
         const bool is_n_tail = ncolumns - n < n_blk_step;
         const bool is_k_tail = nrows - k < k_blk_step;
 
-        if (req_cvtf82f16_)
+        if (req_cvtf82f16_) {
             f8_to_f16_upconvert(
                     conf_->orig_wei_dt, src_vmm0, load_addr0, false, true);
-        else {
+        } else {
             const auto src_vmm1 = get_vmm(blk, 1);
             const dim_t stride = (n_blk_step * typesize_) / src_elems_per_byte_;
             auto load_addr1
