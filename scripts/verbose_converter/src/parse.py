@@ -603,11 +603,40 @@ class LegacyParserImpl(ParserImpl):
 class V1ParserImpl(ParserImpl):
     def parse_md(self, descriptor):
         fields = descriptor.split(":")
+        format_kind = fields[3]
+
+        if (
+            format_kind == "sparse"
+            and len(fields) > 4
+            and fields[4] == "grouped"
+        ):
+            # arg:dt:props:sparse:grouped:var_dim_idx:group_count::flags
+            if len(fields) < 9:
+                raise ParseError(
+                    f"grouped MD '{descriptor}' is missing "
+                    "var_dim_idx:group_count"
+                )
+            flags = self.parse_md_flags(fields[8], fields[9:])
+            return ir.MemoryDescriptor(
+                arg=fields[0],
+                data_type=fields[1],
+                properties=fields[2],
+                format_kind=format_kind,
+                tag="",
+                strides="",
+                flags=flags,
+                grouped=ir.MemoryDescriptor.GroupedDesc(
+                    variable_dim_idx=int(fields[5]),
+                    group_count=int(fields[6]),
+                ),
+            )
+
+        # non-grouped sparse (csr/coo) puts its encoding in the tag field
         return ir.MemoryDescriptor(
             arg=fields[0],
             data_type=fields[1],
             properties=fields[2],
-            format_kind=fields[3],
+            format_kind=format_kind,
             tag=fields[4],
             strides=fields[5],
             flags=self.parse_md_flags(fields[6], fields[7:]),

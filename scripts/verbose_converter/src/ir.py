@@ -106,6 +106,11 @@ class MemoryDescriptor(Mapping):
                 my_str += f":sa{self.scale_adjust}"
             return my_str
 
+    @dataclass
+    class GroupedDesc:
+        variable_dim_idx: int
+        group_count: int
+
     arg: str
     data_type: str
     properties: str
@@ -113,6 +118,7 @@ class MemoryDescriptor(Mapping):
     tag: str
     flags: Flags
     strides: str = ""  # Pre-v3.1 does not have strides
+    grouped: Optional[GroupedDesc] = None
 
     padding = alias("properties")
 
@@ -124,17 +130,19 @@ class MemoryDescriptor(Mapping):
         yield "padding"
 
     def _format(self, tag: str, convert) -> str:
-        header = f"{self.arg}:{self.data_type}"
-        return ":".join(
-            [
-                header,
-                self.properties,
-                self.format_kind,
-                tag,
-                self.strides,
-                convert(self.flags),
+        parts = [self.arg, self.data_type, self.properties, self.format_kind]
+        if self.grouped is not None:
+            g = self.grouped
+            parts += [
+                "grouped",
+                str(g.variable_dim_idx),
+                str(g.group_count),
+                "",
             ]
-        )
+        else:
+            parts += [tag, self.strides]
+        parts.append(convert(self.flags))
+        return ":".join(parts)
 
     def __str__(self):
         return self._format(self.tag, str)
