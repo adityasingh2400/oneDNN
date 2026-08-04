@@ -17,8 +17,13 @@
 #ifndef GPU_INTEL_COMPUTE_UKERNELS_HPP
 #define GPU_INTEL_COMPUTE_UKERNELS_HPP
 
+#include <algorithm>
+
 #include "common/engine.hpp"
+#include "gpu/intel/compute/device_info.hpp"
+#include "gpu/intel/compute/kernel_ctx.hpp"
 #include "gpu/intel/engine.hpp"
+#include "xpu/utils.hpp"
 
 namespace gemmstone {
 namespace microkernel {
@@ -39,6 +44,35 @@ bool mayiuse_microkernels(const engine_t *engine);
 // returning a non-success status if it cannot be used.
 status_t validate_microkernel(const gemmstone::microkernel::Package &package,
         const char *kernel_name);
+
+// Embeds microkernel shims in a kernel context, assigning microkernel IDs and
+// requesting the GRF mode the packages need.
+class microkernel_shims_t {
+public:
+    microkernel_shims_t(
+            kernel_ctx_t &kernel_ctx, int subgroup_size, gpu_arch_t arch)
+        : kernel_ctx_(kernel_ctx), subgroup_size_(subgroup_size), arch_(arch) {}
+
+    void add(const char *header_name, const char *decorator,
+            const gemmstone::microkernel::Package &package);
+
+    void require_grfs(int grf_min) { grf_min_ = std::max(grf_min_, grf_min); }
+
+    // Applies the GRF mode required by the packages added so far.
+    void finish();
+
+private:
+    kernel_ctx_t &kernel_ctx_;
+    int subgroup_size_;
+    gpu_arch_t arch_;
+    uint32_t next_id_ = 0;
+    int grf_min_ = 0;
+};
+
+// Splices the machine code of the microkernels embedded in `code` into the
+// program binary IGC compiled from it. Callers check hasMicrokernels() first.
+status_t fuse_microkernels(
+        xpu::binary_t &binary, const char *code, int grf_size);
 
 } // namespace compute
 } // namespace intel
