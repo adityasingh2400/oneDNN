@@ -19,6 +19,7 @@
 
 #include <limits.h>
 #include <vector>
+#include <type_traits>
 
 #include "common/bit_cast.hpp"
 #include "common/compiler_workarounds.hpp"
@@ -84,14 +85,17 @@ inline int float2int(float x) {
     return utils::bit_cast<int>(x);
 }
 
-inline void tc_configure_tile(palette_config_t *tc, int t, int rows, int cols) {
-    const bool rows_ok = (size_t)t < sizeof(tc->rows) / sizeof(tc->rows[0]);
-    const bool cols_ok = (size_t)t < sizeof(tc->cols) / sizeof(tc->cols[0]);
-    if (rows_ok && cols_ok) {
-        tc->rows[t] = rows;
-        tc->cols[t] = cols;
-    } else {
-        assert(!"out of range");
+inline void tc_configure_tile(
+        palette_config_t *tc, dim_t t, dim_t rows, dim_t cols) {
+    const bool idx_ok = t >= 0 && t < palette_config_t::max_size;
+    const bool rows_ok = rows >= 0 && rows <= UINT8_MAX;
+    const bool cols_ok = cols >= 0 && cols <= UINT16_MAX;
+    assert(idx_ok && "tile index out of range");
+    assert(rows_ok && "rows value exceeds uint8_t range");
+    assert(cols_ok && "cols value exceeds uint16_t range");
+    if (idx_ok && rows_ok && cols_ok) {
+        tc->rows[t] = static_cast<uint8_t>(rows);
+        tc->cols[t] = static_cast<uint16_t>(cols);
     }
 }
 
@@ -165,13 +169,13 @@ public:
     using c_compatible::operator delete[];
 
 private:
-    const size_t xmm_len = 16;
+    const int xmm_len = 16;
 #ifdef _WIN32
-    const size_t xmm_to_preserve_start = 6;
-    const size_t xmm_to_preserve = 10;
+    const int xmm_to_preserve_start = 6;
+    const int xmm_to_preserve = 10;
 #else
-    const size_t xmm_to_preserve_start = 0;
-    const size_t xmm_to_preserve = 0;
+    const int xmm_to_preserve_start = 0;
+    const int xmm_to_preserve = 0;
 #endif
 
     const size_t num_abi_save_gpr_regs
@@ -194,6 +198,67 @@ public:
         _op_mxcsr = 4u,
     };
 
+    using Xbyak::CodeGenerator::add;
+    using Xbyak::CodeGenerator::cmp;
+    using Xbyak::CodeGenerator::imul;
+    using Xbyak::CodeGenerator::sub;
+
+    // The following templated methods are useful for non-int immediate
+    // inputs to avoid implicit integer conversion. They are casting imm to int
+    // with assert check on boundaries.
+    template <typename T>
+    using enable_if_wide_imm_t =
+            typename std::enable_if<std::is_same<T, dim_t>::value
+                            || std::is_same<T, size_t>::value,
+                    int>::type;
+
+    // Helpers check int32 boundaries + non-negative case
+    template <typename T>
+    static bool imm_fits_int32(T imm) {
+        return imm >= static_cast<T>(INT_MIN) && imm <= static_cast<T>(INT_MAX);
+    }
+    template <typename T>
+    static bool imm_fits_int32_nonneg(T imm) {
+        return imm >= 0 && imm <= static_cast<T>(INT_MAX);
+    }
+    // Wrappers to use with non-conformed imm dt
+    template <typename T, enable_if_wide_imm_t<T> = 0>
+    void add(const Xbyak::Operand &op, T imm) {
+        JIT_ASSERT(imm_fits_int32_nonneg(imm));
+        Xbyak::CodeGenerator::add(op, static_cast<uint32_t>(imm));
+    }
+
+    template <typename T, enable_if_wide_imm_t<T> = 0>
+    void sub(const Xbyak::Operand &op, T imm) {
+        JIT_ASSERT(imm_fits_int32_nonneg(imm));
+        Xbyak::CodeGenerator::sub(op, static_cast<uint32_t>(imm));
+    }
+
+    template <typename T, enable_if_wide_imm_t<T> = 0>
+    void cmp(const Xbyak::Operand &op, T imm) {
+        JIT_ASSERT(imm_fits_int32(imm));
+        Xbyak::CodeGenerator::cmp(
+                op, static_cast<uint32_t>(static_cast<int32_t>(imm)));
+    }
+
+    template <typename T, enable_if_wide_imm_t<T> = 0>
+    void imul(const Xbyak::Reg64 &dst, const Xbyak::Operand &src, T imm) {
+        JIT_ASSERT(imm_fits_int32(imm));
+        Xbyak::CodeGenerator::imul(dst, src, static_cast<int>(imm));
+    }
+
+    // Casts register index dim_t -> int with checking assert
+    static int xbyak_register_index(dim_t index) {
+        JIT_ASSERT_RET(index >= INT_MIN && index <= INT_MAX, 0);
+        return static_cast<int>(index);
+    }
+
+    static int xbyak_address_scale(dim_t scale) {
+        // The fallback is returned only after XByak records the error.
+        JIT_ASSERT_RET(utils::one_of(scale, 1, 2, 4, 8), 0);
+        return static_cast<int>(scale);
+    }
+
     Xbyak::Reg64 param1 = abi_param1;
     const int EVEX_max_8b_offt = 0x200;
     const Xbyak::Reg64 reg_EVEX_max_8b_offt = rbp;
@@ -214,7 +279,7 @@ public:
     void preamble() {
         if (xmm_to_preserve) {
             sub(rsp, xmm_to_preserve * xmm_len);
-            for (size_t i = 0; i < xmm_to_preserve; ++i)
+            for (int i = 0; i < xmm_to_preserve; ++i)
                 uni_vmovdqu(ptr[rsp + i * xmm_len],
                         Xbyak::Xmm(xmm_to_preserve_start + i));
         }
@@ -260,7 +325,7 @@ public:
     // Note: that we cannot use RBP inside as we override it in preamble
     // for address computation in EVEX instructions
     inline Xbyak::RegExp get_stack_params_address(bool after_prolog = true) {
-        int saved_regs_size = after_prolog ? get_size_of_abi_save_regs() : 0;
+        size_t saved_regs_size = after_prolog ? get_size_of_abi_save_regs() : 0;
 #ifdef _WIN32
         // Using stack layout described in MS ABI
         // (https://docs.microsoft.com/en-us/cpp/build/stack-usage?view=vs-2019)
@@ -290,7 +355,7 @@ public:
         for (size_t i = 0; i < num_abi_save_gpr_regs; ++i)
             pop(Xbyak::Reg64(abi_save_gpr_regs[num_abi_save_gpr_regs - 1 - i]));
         if (xmm_to_preserve) {
-            for (size_t i = 0; i < xmm_to_preserve; ++i)
+            for (int i = 0; i < xmm_to_preserve; ++i)
                 uni_vmovdqu(Xbyak::Xmm(xmm_to_preserve_start + i),
                         ptr[rsp + i * xmm_len]);
             add(rsp, xmm_to_preserve * xmm_len);
@@ -309,7 +374,7 @@ public:
         using Xbyak::RegExp;
         using Xbyak::Zmm;
 
-        assert(raw_offt <= INT_MAX);
+        JIT_ASSERT_RET(raw_offt <= INT_MAX, ptr[RegExp() + base]);
         auto offt = static_cast<int>(raw_offt);
         int scale = 0;
 
@@ -370,7 +435,7 @@ public:
         }
     }
 
-    void safe_add(const Xbyak::Reg64 &base, size_t raw_offt,
+    void safe_add(const Xbyak::Reg64 &base, dim_t raw_offt,
             const Xbyak::Reg64 &reg_offt) {
         if (raw_offt > INT_MAX) {
             mov(reg_offt, raw_offt);
@@ -380,7 +445,7 @@ public:
         }
     }
 
-    void safe_sub(const Xbyak::Reg64 &base, size_t raw_offt,
+    void safe_sub(const Xbyak::Reg64 &base, dim_t raw_offt,
             const Xbyak::Reg64 &reg_offt) {
         if (raw_offt > INT_MAX) {
             mov(reg_offt, raw_offt);
@@ -1443,7 +1508,7 @@ public:
     void uni_vpslld(
             const Xbyak::Xmm &x, const Xbyak::Operand &op, const int imm) {
         if (is_valid_isa(avx))
-            vpslld(x, op, imm);
+            vpslld(x, op, static_cast<uint8_t>(imm));
         else {
             if (!x.isEqualIfNotInherited(op)) movdqa(x, op);
             pslld(x, imm);
@@ -1451,13 +1516,13 @@ public:
     }
     void uni_vpslld(
             const Xbyak::Ymm &x, const Xbyak::Operand &op, const int imm) {
-        vpslld(x, op, imm);
+        vpslld(x, op, static_cast<uint8_t>(imm));
     }
 
     void uni_vpsrld(
             const Xbyak::Xmm &x, const Xbyak::Operand &op, const int imm) {
         if (is_valid_isa(avx))
-            vpsrld(x, op, imm);
+            vpsrld(x, op, static_cast<uint8_t>(imm));
         else {
             if (!x.isEqualIfNotInherited(op)) uni_vmovups(x, op);
             psrld(x, imm);
@@ -1465,7 +1530,7 @@ public:
     }
     void uni_vpsrld(
             const Xbyak::Ymm &x, const Xbyak::Operand &op, const int imm) {
-        vpsrld(x, op, imm);
+        vpsrld(x, op, static_cast<uint8_t>(imm));
     }
 
     void uni_vmaxps(const Xbyak::Xmm &x, const Xbyak::Operand &op1,
@@ -1541,15 +1606,15 @@ public:
     void uni_vcmpps(const Xbyak::Xmm &x1, const Xbyak::Xmm &x2,
             const Xbyak::Operand &op, int cmp_predicate) {
         if (is_valid_isa(avx))
-            vcmpps(x1, x2, op, cmp_predicate);
+            vcmpps(x1, x2, op, static_cast<uint8_t>(cmp_predicate));
         else {
             if (x1.getIdx() != x2.getIdx()) uni_vmovups(x1, x2);
-            cmpps(x1, op, cmp_predicate);
+            cmpps(x1, op, static_cast<uint8_t>(cmp_predicate));
         }
     }
     void uni_vcmpps(const Xbyak::Ymm &x1, const Xbyak::Ymm &x2,
             const Xbyak::Operand &op, int cmp_predicate) {
-        vcmpps(x1, x2, op, cmp_predicate);
+        vcmpps(x1, x2, op, static_cast<uint8_t>(cmp_predicate));
     }
 
     void uni_vtestps(const Xbyak::Xmm &x1, const Xbyak::Operand &op) {
@@ -1593,7 +1658,7 @@ public:
             const Xbyak::Operand &op, const int imm) {
         assert(!x1.isZMM() && !x2.isZMM());
         if (is_valid_isa(avx))
-            vblendps(x1, x2, op, imm);
+            vblendps(x1, x2, op, static_cast<uint8_t>(imm));
         else {
             if (!x1.isEqualIfNotInherited(x2)) movups(x1, x2);
             blendps(x1, op, imm);
@@ -1605,9 +1670,9 @@ public:
         if (is_valid_isa(avx512_core))
             vrndscaleps(x, op, imm & 0x3);
         else if (is_valid_isa(avx))
-            vroundps(x, op, imm);
+            vroundps(x, op, static_cast<uint8_t>(imm));
         else
-            roundps(x, op, imm);
+            roundps(x, op, static_cast<uint8_t>(imm));
     }
 
     void uni_vroundps(
@@ -1615,7 +1680,7 @@ public:
         if (is_valid_isa(avx512_core))
             vrndscaleps(x, op, imm & 0x3);
         else
-            vroundps(x, op, imm);
+            vroundps(x, op, static_cast<uint8_t>(imm));
     }
 
     void uni_vroundps(
@@ -1775,50 +1840,50 @@ public:
     void uni_vpinsrb(const Xbyak::Xmm &x1, const Xbyak::Xmm &x2,
             const Xbyak::Operand &op, const int imm) {
         if (is_valid_isa(avx))
-            vpinsrb(x1, x2, op, imm);
+            vpinsrb(x1, x2, op, static_cast<uint8_t>(imm));
         else {
             if (x1.getIdx() != x2.getIdx()) movdqa(x1, x2);
-            pinsrb(x1, op, imm);
+            pinsrb(x1, op, static_cast<uint8_t>(imm));
         }
     }
 
     void uni_vpinsrb(const Xbyak::Ymm &x1, const Xbyak::Ymm &x2,
             const Xbyak::Operand &op, const int imm) {
-        vpinsrb(x1, x2, op, imm);
+        vpinsrb(x1, x2, op, static_cast<uint8_t>(imm));
     }
 
     void uni_vpinsrd(const Xbyak::Xmm &x1, const Xbyak::Xmm &x2,
             const Xbyak::Operand &op, const int imm) {
         if (is_valid_isa(avx))
-            vpinsrd(x1, x2, op, imm);
+            vpinsrd(x1, x2, op, static_cast<uint8_t>(imm));
         else {
             if (x1.getIdx() != x2.getIdx()) movdqa(x1, x2);
-            pinsrd(x1, op, imm);
+            pinsrd(x1, op, static_cast<uint8_t>(imm));
         }
     }
     void uni_vpinsrd(const Xbyak::Ymm &x1, const Xbyak::Ymm &x2,
             const Xbyak::Operand &op, const int imm) {
-        vpinsrd(x1, x2, op, imm);
+        vpinsrd(x1, x2, op, static_cast<uint8_t>(imm));
     }
 
     void uni_vpinsrq(const Xbyak::Xmm &x1, const Xbyak::Xmm &x2,
             const Xbyak::Operand &op, const int imm) {
         if (is_valid_isa(avx))
-            vpinsrq(x1, x2, op, imm);
+            vpinsrq(x1, x2, op, static_cast<uint8_t>(imm));
         else {
             if (x1.getIdx() != x2.getIdx()) movdqa(x1, x2);
-            pinsrq(x1, op, imm);
+            pinsrq(x1, op, static_cast<uint8_t>(imm));
         }
     }
     void uni_vpinsrq(const Xbyak::Ymm &x1, const Xbyak::Ymm &x2,
             const Xbyak::Operand &op, const int imm) {
-        vpinsrq(x1, x2, op, imm);
+        vpinsrq(x1, x2, op, static_cast<uint8_t>(imm));
     }
 
     void uni_vpinsrw(const Xbyak::Xmm &x1, const Xbyak::Xmm &x2,
             const Xbyak::Operand &op, const int imm) {
         if (is_valid_isa(avx))
-            vpinsrw(x1, x2, op, imm);
+            vpinsrw(x1, x2, op, static_cast<uint8_t>(imm));
         else {
             if (x1.getIdx() != x2.getIdx()) movdqa(x1, x2);
             pinsrw(x1, op, imm);
@@ -1826,56 +1891,56 @@ public:
     }
     void uni_vpinsrw(const Xbyak::Ymm &x1, const Xbyak::Ymm &x2,
             const Xbyak::Operand &op, const int imm) {
-        vpinsrw(x1, x2, op, imm);
+        vpinsrw(x1, x2, op, static_cast<uint8_t>(imm));
     }
 
     void uni_vpextrb(
             const Xbyak::Operand &op, const Xbyak::Xmm &x, const int imm) {
         if (is_valid_isa(avx))
-            vpextrb(op, x, imm);
+            vpextrb(op, x, static_cast<uint8_t>(imm));
         else
-            pextrb(op, x, imm);
+            pextrb(op, x, static_cast<uint8_t>(imm));
     }
 
     void uni_vpextrb(
             const Xbyak::Operand &op, const Xbyak::Ymm &x, const int imm) {
-        vpextrb(op, x, imm);
+        vpextrb(op, x, static_cast<uint8_t>(imm));
     }
 
     void uni_vpextrw(
             const Xbyak::Operand &op, const Xbyak::Xmm &x, const int imm) {
         if (is_valid_isa(avx))
-            vpextrw(op, x, imm);
+            vpextrw(op, x, static_cast<uint8_t>(imm));
         else
-            pextrw(op, x, imm);
+            pextrw(op, x, static_cast<uint8_t>(imm));
     }
     void uni_vpextrw(
             const Xbyak::Operand &op, const Xbyak::Ymm &x, const int imm) {
-        vpextrw(op, x, imm);
+        vpextrw(op, x, static_cast<uint8_t>(imm));
     }
 
     void uni_vpextrd(
             const Xbyak::Operand &op, const Xbyak::Xmm &x, const int imm) {
         if (is_valid_isa(avx))
-            vpextrd(op, x, imm);
+            vpextrd(op, x, static_cast<uint8_t>(imm));
         else
-            pextrd(op, x, imm);
+            pextrd(op, x, static_cast<uint8_t>(imm));
     }
     void uni_vpextrd(
             const Xbyak::Operand &op, const Xbyak::Ymm &x, const int imm) {
-        vpextrd(op, x, imm);
+        vpextrd(op, x, static_cast<uint8_t>(imm));
     }
 
     void uni_vpextrq(
             const Xbyak::Operand &op, const Xbyak::Xmm &x, const int imm) {
         if (is_valid_isa(avx))
-            vpextrq(op, x, imm);
+            vpextrq(op, x, static_cast<uint8_t>(imm));
         else
-            pextrq(op, x, imm);
+            pextrq(op, x, static_cast<uint8_t>(imm));
     }
     void uni_vpextrq(
             const Xbyak::Operand &op, const Xbyak::Ymm &x, const int imm) {
-        vpextrq(op, x, imm);
+        vpextrq(op, x, static_cast<uint8_t>(imm));
     }
 
     void uni_vpmaxsd(const Xbyak::Xmm &x1, const Xbyak::Xmm &x2,
@@ -1951,7 +2016,7 @@ public:
     void uni_vpslldq(
             const Xbyak::Xmm &x, const Xbyak::Operand &op, const int imm) {
         if (is_valid_isa(avx))
-            vpslldq(x, op, imm);
+            vpslldq(x, op, static_cast<uint8_t>(imm));
         else {
             if (!x.isEqualIfNotInherited(op)) movdqa(x, op);
             pslldq(x, imm);
@@ -1959,7 +2024,7 @@ public:
     }
     void uni_vpslldq(
             const Xbyak::Ymm &x, const Xbyak::Operand &op, const int imm) {
-        vpslldq(x, op, imm);
+        vpslldq(x, op, static_cast<uint8_t>(imm));
     }
 
     void uni_vpmovsxwd(const Xbyak::Xmm &x, const Xbyak::Operand &op) {
