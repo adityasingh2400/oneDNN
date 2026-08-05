@@ -603,6 +603,7 @@ struct brgemm_desc_t {
             sz += get_fused_copy_a_wsp_buffer_size();
         } else
             sz = get_convert_wsp_buffer_size();
+        printf("wsp buffer size: %d\n", sz);
         return sz;
     }
 

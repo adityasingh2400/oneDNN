@@ -2897,7 +2897,7 @@ void jit_brgemm_kernel_t<Wmm>::maybe_pre_process_buf_A(
     reg64_savable_guard_t reg_fp8_buf_guard({&reg64_fp8_aux, &reg_buf_A});
 
     reg_buf_A.restore();
-
+    printf("bd b: %d, bd e: %d\n", bd_b, bd_e);
     for (dim_t bd = bd_b; bd < bd_e; bd++) {
         const auto offset = A_offset(bd, 0);
         auto vmm = vmm_tmp(0);
